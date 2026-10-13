@@ -1,0 +1,6 @@
+config.sh
+*.notified
+watchlist
+jobmon.log
+launchd.*.log
+.DS_Store

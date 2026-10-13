@@ -1,0 +1,235 @@
+#!/bin/bash
+# jobmon — 监测 Slurm 作业结束，通过钉钉机器人 + macOS 通知提醒
+set -uo pipefail
+
+STATE_DIR="${JOBMON_STATE_DIR:-$HOME/.local/state/jobmon}"
+CONFIG="${JOBMON_CONFIG:-$HOME/.config/jobmon/config.sh}"
+WATCHLIST="$STATE_DIR/watchlist"
+LOGFILE="$STATE_DIR/jobmon.log"
+LABEL="cn.ojlab.jobmon"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOGFILE"; }
+
+enable_agent() {
+  [ -r "$PLIST" ] || { log "缺少 $PLIST"; return 1; }
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1
+}
+
+# 必须在脚本即将退出的最后一步调用：bootout 会连带终止本进程
+disable_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+agent_state() {
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && echo "已唤醒" || echo "已休眠"
+}
+
+pick() { for c in "$@"; do [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }; done; return 1; }
+
+PY="$(pick "${JOBMON_PYTHON:-}" "$(command -v python3 2>/dev/null)" /usr/bin/python3 /opt/homebrew/bin/python3)" \
+  || { log "找不到 python3"; exit 1; }
+
+if [ ! -r "$CONFIG" ]; then
+  echo "缺少配置文件: $CONFIG （复制 config.sh.example 过去并填写）" >&2
+  exit 1
+fi
+. "$CONFIG"
+
+if [ -z "${SSH_HOST:-}" ] || [ -z "${CLUSTER_USER:-}" ]; then
+  echo "请先在 $CONFIG 里设置 SSH_HOST 和 CLUSTER_USER" >&2
+  exit 1
+fi
+POLL_DESKTOP="${POLL_DESKTOP:-1}"
+
+rssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 "$SSH_HOST" "$@" 2>/dev/null; }
+
+notify_desktop() {
+  [ "$POLL_DESKTOP" = "1" ] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  /usr/bin/osascript -e "on run a" -e "display notification (item 2 of a) with title (item 1 of a) sound name \"Glass\"" -e "end run" "$1" "$2" >/dev/null 2>&1
+}
+
+notify_dingtalk() {
+  [ -n "${DINGTALK_WEBHOOK:-}" ] || return 0
+  JOBMON_DT_WEBHOOK="$DINGTALK_WEBHOOK" \
+  JOBMON_DT_SECRET="${DINGTALK_SECRET:-}" \
+  JOBMON_DT_KEYWORD="${DINGTALK_KEYWORD:-}" \
+  JOBMON_DT_TITLE="$1" JOBMON_DT_TEXT="$2" \
+  "$PY" - <<'PYTHON'
+import base64, hashlib, hmac, json, os, time, urllib.parse, urllib.request
+
+webhook = os.environ["JOBMON_DT_WEBHOOK"]
+secret = os.environ.get("JOBMON_DT_SECRET", "")
+keyword = os.environ.get("JOBMON_DT_KEYWORD", "")
+title, text = os.environ["JOBMON_DT_TITLE"], os.environ["JOBMON_DT_TEXT"]
+
+if keyword:
+    if keyword not in title:
+        title = f"{keyword} {title}"
+    text = f"{text}\n\n`{keyword}`"
+if secret:
+    ts = str(round(time.time() * 1000))
+    digest = hmac.new(secret.encode(), f"{ts}\n{secret}".encode(), hashlib.sha256).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(digest))
+    webhook += ("&" if "?" in webhook else "?") + f"timestamp={ts}&sign={sign}"
+
+body = json.dumps({"msgtype": "markdown", "markdown": {"title": title, "text": text}}).encode()
+req = urllib.request.Request(webhook, data=body, headers={"Content-Type": "application/json"})
+try:
+    resp = json.loads(urllib.request.urlopen(req, timeout=15).read() or b"{}")
+except Exception as exc:
+    print(f"钉钉推送异常: {exc}", flush=True)
+    raise SystemExit(1)
+if resp.get("errcode") != 0:
+    print(f"钉钉推送失败: {resp}", flush=True)
+    raise SystemExit(1)
+PYTHON
+}
+
+notify() {
+  notify_dingtalk "$1" "$2"
+  notify_desktop "$1" "$(printf '%s' "$2" | sed 's/[*#`]//g' | tr '\n' ' ' | cut -c1-120)"
+}
+
+add_watch() {
+  touch "$WATCHLIST"
+  grep -qxF "$1" "$WATCHLIST" 2>/dev/null || printf '%s\n' "$1" >>"$WATCHLIST"
+}
+
+watched_ids() { [ -r "$WATCHLIST" ] && sort -u "$WATCHLIST" | grep -E '^[0-9]+$'; }
+
+unwatch() {
+  [ -r "$WATCHLIST" ] || return 0
+  grep -vxF "$1" "$WATCHLIST" >"$WATCHLIST.tmp" 2>/dev/null || true
+  mv "$WATCHLIST.tmp" "$WATCHLIST"
+}
+
+# 唤醒期间新提交的作业也会被自动登记，不必逐条 watch
+discover() {
+  local id
+  while read -r id; do
+    [ -n "$id" ] && add_watch "$id"
+  done < <(rssh "squeue -u '$CLUSTER_USER' -h -o '%i'")
+}
+
+check_one() {
+  local id="$1" line jid name state exitcode elapsed end marker icon verdict
+  marker="$STATE_DIR/$id.notified"
+  [ -e "$marker" ] && { unwatch "$id"; return 0; }
+
+  line="$(rssh "sacct -j '$id' -X --noheader --parsable2 --format=JobID,JobName,State,ExitCode,Elapsed,End" | head -1)"
+  # 空结果 = ssh 不通 / 作业还没写进 sacct，绝不能当成"已结束"
+  [ -z "$line" ] && return 0
+
+  IFS='|' read -r jid name state exitcode elapsed end <<<"$line"
+  state="${state%$'\r'}"
+  case "$state" in
+    PENDING|RUNNING|CONFIGURING|COMPLETING|SUSPENDED|RESIZING|REQUEUE_*|SPECIAL_EXIT) return 0 ;;
+  esac
+
+  if [ "$exitcode" = "0:0" ]; then
+    icon="✅"; verdict="成功"
+  else
+    icon="❌"; verdict="失败 (ExitCode $exitcode)"
+  fi
+
+  notify "$icon 作业 $id $verdict" "### $icon 作业 $id $verdict
+- **作业名**: ${name:-N/A}
+- **状态**: $state / $exitcode
+- **用时**: ${elapsed:-N/A}
+- **结束**: ${end:-N/A}
+- **集群**: $SSH_HOST"
+
+  : >"$marker"
+  unwatch "$id"
+  log "job $id -> $state $exitcode, 已通知"
+}
+
+cmd_poll() {
+  # 列表空 = 上一轮已通知完所有作业，这一轮在发起任何 SSH 之前卸载自己
+  if [ -z "$(watched_ids)" ]; then
+    log "监测列表为空，卸载定时任务"
+    disable_agent
+    return 0
+  fi
+  rssh "true" || { log "ssh $SSH_HOST 不可达，本轮跳过"; return 0; }
+  find "$STATE_DIR" -name '*.notified' -mtime +30 -delete 2>/dev/null
+  discover
+  local id
+  for id in $(watched_ids); do check_one "$id"; done
+}
+
+cmd_on() {
+  local id
+  if [ "$#" -gt 0 ]; then
+    for id in "$@"; do add_watch "$id"; done
+  else
+    rssh "true" || { echo "⚠️  ssh $SSH_HOST 不可达，先确认网络/VPN"; return 1; }
+    discover
+  fi
+  if [ -z "$(watched_ids)" ]; then
+    echo "队列里没有你的作业。提交后再运行 jobmon on，或 jobmon on <作业ID> 手动登记。"
+    return 1
+  fi
+  enable_agent || { echo "启动定时任务失败，检查 $PLIST"; return 1; }
+  echo "已唤醒监测：$(watched_ids | tr '\n' ' ')"
+  echo "每 3 分钟检查一次，全部结束后自动休眠。"
+}
+
+cmd_off() {
+  disable_agent
+  : >"$WATCHLIST"
+  echo "已停止监测并清空列表（已通知记录保留，不会重复提醒）。"
+}
+
+cmd_status() {
+  echo "监测器: $(agent_state)"
+  if ! rssh "true"; then echo "⚠️  ssh $SSH_HOST 不可达"; return 1; fi
+  echo "监测中 (${SSH_HOST} / ${CLUSTER_USER}):"
+  local id found=0
+  for id in $(watched_ids); do
+    found=1
+    printf '  %s  %s\n' "$id" "$(rssh "sacct -j '$id' -X --noheader --parsable2 --format=JobName,State,ExitCode,Elapsed" | head -1)"
+  done
+  [ "$found" = "1" ] || echo "  (空)"
+  echo "队列中: $(rssh "squeue -u '$CLUSTER_USER' -h -o '%i %j %T'" | tr '\n' ' ')"
+}
+
+case "${1:-status}" in
+  on|start|enable|watch|add)       shift; cmd_on "$@" ;;
+  off|stop|disable)                cmd_off ;;
+  forget|remove|unwatch)           shift; for id in "$@"; do unwatch "$id"; rm -f "$STATE_DIR/$id.notified"; done; echo "已移除: $*" ;;
+  poll)                            cmd_poll ;;
+  status|ls)                       cmd_status ;;
+  reset)                           rm -f "$STATE_DIR"/*.notified; echo "已清除通知记录" ;;
+  test)
+    if [ -z "${DINGTALK_WEBHOOK:-}" ]; then
+      echo "还没配置 DINGTALK_WEBHOOK，请先编辑 $CONFIG" >&2
+      exit 1
+    fi
+    notify "🔔 jobmon 测试" "### 🔔 jobmon 测试
+如果你在手机上看到这条，钉钉配置就通了。"
+    echo "已发送测试消息（无报错即成功）"
+    ;;
+  -h|--help|help)
+    cat <<EOF
+用法: jobmon [命令] [作业ID...]
+
+  on                唤醒监测：登记当前队列里你的所有作业，开始每 3 分钟轮询
+  on <id>...        唤醒并额外登记指定作业
+  off               停止监测，清空列表
+  status            查看监测器状态、监测中的作业、队列（直接敲 jobmon 即可）
+  forget <id>       从列表移除某个作业
+  test              发送一条钉钉测试消息
+  reset             清除"已通知"标记，让作业重新可通知
+  poll              手动检查一轮（launchd 内部使用）
+
+全部作业结束后会自己发通知并休眠，无需手动关闭。
+配置文件: $CONFIG   状态目录: $STATE_DIR   日志: $LOGFILE
+EOF
+    ;;
+  *) echo "未知命令: $1" >&2; exit 2 ;;
+esac
