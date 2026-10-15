@@ -5,8 +5,9 @@ set -uo pipefail
 STATE_DIR="${JOBMON_STATE_DIR:-$HOME/.local/state/jobmon}"
 CONFIG="${JOBMON_CONFIG:-$HOME/.config/jobmon/config.sh}"
 WATCHLIST="$STATE_DIR/watchlist"
+SESSION="$STATE_DIR/session"
 LOGFILE="$STATE_DIR/jobmon.log"
-LABEL="cn.ojlab.jobmon"
+LABEL="${JOBMON_LABEL:-cn.ojlab.jobmon}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 mkdir -p "$STATE_DIR"
 
@@ -130,22 +131,59 @@ check_one() {
     PENDING|RUNNING|CONFIGURING|COMPLETING|SUSPENDED|RESIZING|REQUEUE_*|SPECIAL_EXIT) return 0 ;;
   esac
 
-  if [ "$exitcode" = "0:0" ]; then
-    icon="✅"; verdict="成功"
+  # 被取消/超时的作业 ExitCode 也可能是 0:0，成功必须是 COMPLETED 且退出码为 0
+  if [ "$state" = "COMPLETED" ] && [ "$exitcode" = "0:0" ]; then
+    icon="✅"; verdict="成功"; flag="OK"
   else
-    icon="❌"; verdict="失败 (ExitCode $exitcode)"
+    icon="❌"; verdict="需要关注"; flag="BAD"
   fi
 
-  notify "$icon 作业 $id $verdict" "### $icon 作业 $id $verdict
+  if [ "${NOTIFY_EACH:-1}" != "0" ]; then
+    notify "$icon 作业 $id $verdict" "### $icon 作业 $id $verdict
 - **作业名**: ${name:-N/A}
 - **状态**: $state / $exitcode
 - **用时**: ${elapsed:-N/A}
 - **结束**: ${end:-N/A}
 - **集群**: $SSH_HOST"
+  fi
 
   : >"$marker"
   unwatch "$id"
-  log "job $id -> $state $exitcode, 已通知"
+  printf '%s|%s|%s|%s|%s\n' "$id" "${name:-N/A}" "$state" "$exitcode" "$flag" >>"$SESSION"
+  log "job $id -> $state $exitcode, $flag"
+}
+
+# 一批作业跑完补一条汇总；单个作业不值得多打扰一次
+summarize_session() {
+  [ -r "$SESSION" ] || return 0
+  local total fail ok body
+  total=$(wc -l <"$SESSION" | tr -d ' ')
+  fail=$(grep -c '|BAD$' "$SESSION")
+  ok=$((total - fail))
+
+  # 关掉逐条通知后，汇总是唯一的结果反馈，不再受数量门槛限制
+  if [ "${NOTIFY_EACH:-1}" != "0" ] && [ "$total" -lt "${SUMMARY_MIN_JOBS:-2}" ]; then
+    rm -f "$SESSION"
+    return 0
+  fi
+
+  if [ "$fail" -eq 0 ]; then
+    body="### 🎉 本轮 $total 个作业全部成功
+- **集群**: $SSH_HOST"
+  else
+    body="### 🏁 本轮 $total 个作业已结束
+- **成功**: $ok
+- **异常**: $fail
+
+**需要关注的作业**
+$(grep '|BAD$' "$SESSION" | head -15 | awk -F'|' '{printf "- %s %s (%s / %s)\n", $1, $2, $3, $4}')"
+    [ "$fail" -gt 15 ] && body="$body
+- …另有 $((fail - 15)) 个作业需要关注，用 \`sacct\` 查完整列表"
+  fi
+
+  notify "🏁 本轮 $total 个作业已结束" "$body"
+  rm -f "$SESSION"
+  log "本轮汇总已发送：total=$total ok=$ok fail=$fail"
 }
 
 cmd_poll() {
@@ -160,6 +198,7 @@ cmd_poll() {
   discover
   local id
   for id in $(watched_ids); do check_one "$id"; done
+  [ -z "$(watched_ids)" ] && summarize_session
 }
 
 cmd_on() {
@@ -182,6 +221,7 @@ cmd_on() {
 cmd_off() {
   disable_agent
   : >"$WATCHLIST"
+  rm -f "$SESSION"
   echo "已停止监测并清空列表（已通知记录保留，不会重复提醒）。"
 }
 
@@ -204,7 +244,7 @@ case "${1:-status}" in
   forget|remove|unwatch)           shift; for id in "$@"; do unwatch "$id"; rm -f "$STATE_DIR/$id.notified"; done; echo "已移除: $*" ;;
   poll)                            cmd_poll ;;
   status|ls)                       cmd_status ;;
-  reset)                           rm -f "$STATE_DIR"/*.notified; echo "已清除通知记录" ;;
+  reset)                           rm -f "$STATE_DIR"/*.notified "$SESSION"; echo "已清除通知记录" ;;
   test)
     if [ -z "${DINGTALK_WEBHOOK:-}" ]; then
       echo "还没配置 DINGTALK_WEBHOOK，请先编辑 $CONFIG" >&2
