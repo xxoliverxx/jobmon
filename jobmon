@@ -153,6 +153,14 @@ check_one() {
   log "job $id -> $state $exitcode, $flag"
 }
 
+# 按作业名分组统计，一批十几个同名作业时比逐条罗列好读
+name_breakdown() {
+  awk -F'|' '{n[$2]++; if ($5 == "OK") ok[$2]++}
+             END {for (k in n) {b = n[k] - ok[k] + 0
+                                 if (b > 0) printf "- %s × %d（异常 %d）\n", k, n[k], b
+                                 else printf "- %s × %d\n", k, n[k]}}' "$SESSION" | sort | head -15
+}
+
 # 一批作业跑完补一条汇总；单个作业不值得多打扰一次
 summarize_session() {
   [ -r "$SESSION" ] || return 0
@@ -169,11 +177,11 @@ summarize_session() {
 
   if [ "$fail" -eq 0 ]; then
     body="### 🎉 本轮 $total 个作业全部成功
+$(name_breakdown)
 - **集群**: $SSH_HOST"
   else
-    body="### 🏁 本轮 $total 个作业已结束
-- **成功**: $ok
-- **异常**: $fail
+    body="### 🏁 本轮 $total 个作业已结束（成功 $ok / 异常 $fail）
+$(name_breakdown)
 
 **需要关注的作业**
 $(grep '|BAD$' "$SESSION" | head -15 | awk -F'|' '{printf "- %s %s (%s / %s)\n", $1, $2, $3, $4}')"

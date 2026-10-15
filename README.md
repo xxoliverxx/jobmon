@@ -91,7 +91,19 @@ jobmon on ──► launchctl bootstrap（StartInterval 180s + RunAtLoad）
 | `SUMMARY_MIN_JOBS` | `2` | 本轮作业数达到该值才追加汇总；单个作业不多打扰一次 |
 | `POLL_DESKTOP` | `1` | 是否同时弹 macOS 桌面通知 |
 
-一次提交十几个作业时，把 `NOTIFY_EACH` 设为 `0`：整批只收一条消息，内容形如「本轮 18 个作业已结束，成功 16 / 异常 2」并列出需要关注的作业号与状态。`NOTIFY_EACH=0` 时汇总必定发送，不受 `SUMMARY_MIN_JOBS` 限制。
+一次提交十几个作业时，把 `NOTIFY_EACH` 设为 `0`：整批只收一条消息。汇总按**作业名分组**给出数量，并单独列出需要关注的作业号与状态：
+
+```
+🏁 本轮 5 个作业已结束（成功 3 / 异常 2）
+- demoA_fit × 3（异常 1）
+- demoB_stage × 2（异常 1）
+
+需要关注的作业
+- 91003 demoA_fit (FAILED / 1:0)
+- 91005 demoB_stage (CANCELLED by 123 / 0:0)
+```
+
+`NOTIFY_EACH=0` 时汇总必定发送，不受 `SUMMARY_MIN_JOBS` 限制。
 
 ## 几个刻意的设计
 
