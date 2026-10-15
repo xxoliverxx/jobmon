@@ -206,7 +206,12 @@ cmd_poll() {
   discover
   local id
   for id in $(watched_ids); do check_one "$id"; done
-  [ -z "$(watched_ids)" ] && summarize_session
+  # 本轮就把列表清空了 → 发完汇总立即自我卸载，不留到下一轮
+  if [ -z "$(watched_ids)" ]; then
+    summarize_session
+    log "监测列表已空，立即卸载定时任务"
+    disable_agent
+  fi
 }
 
 cmd_on() {
