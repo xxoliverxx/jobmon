@@ -267,7 +267,8 @@ case "${1:-status}" in
   reset             清除"已通知"标记，让作业重新可通知
   poll              手动检查一轮（launchd 内部使用）
 
-全部作业结束后会自己发通知并休眠，无需手动关闭。
+每个作业结束会逐条通知；一轮作业全部跑完时再补一条汇总，然后自动休眠，无需手动关闭。
+通知条数可用配置里的 NOTIFY_EACH / SUMMARY_MIN_JOBS 调整。
 配置文件: $CONFIG   状态目录: $STATE_DIR   日志: $LOGFILE
 EOF
     ;;
